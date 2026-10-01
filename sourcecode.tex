@@ -1,0 +1,457 @@
+
+\section{Source Code}
+\begin{lstlisting}[language=Python, caption={One-Crossing Switch Algorithm for Gauss Codes}]
+
+import csv
+from collections import defaultdict
+import pandas as pd
+
+
+def tokenize_gauss_code(code):
+    """
+    Convert a compact Gauss code string into a list of tokens.
+    Example:
+        'O1-O2-U1-O3+U2-U3+'
+    becomes:
+        ['O1-', 'O2-', 'U1-', 'O3+', 'U2-', 'U3+']
+    """
+    code = code.strip()
+    if not code:
+        return []
+
+    tokens = []
+    current = code[0]
+
+    for char in code[1:]:
+        if char in ("O", "U"):
+            tokens.append(current)
+            current = char
+        else:
+            current += char
+
+    tokens.append(current)
+    return tokens
+
+
+def parse_tokens_to_dataframe(tokens, knot_name, label):
+    """
+    Convert Gauss code tokens into a DataFrame with columns:
+    knot, label, step, kind, index, sign
+    """
+    rows = []
+
+    for step, token in enumerate(tokens):
+        kind = token[0]
+        index = int(token[1:-1])
+        sign_char = token[-1]
+        sign = 1 if sign_char == "+" else -1
+
+        rows.append({
+            "knot": knot_name,
+            "label": label,
+            "step": step,
+            "kind": kind,
+            "index": index,
+            "sign": sign
+        })
+
+    return pd.DataFrame(rows)
+
+
+def switch_crossing(df_knot, crossing_index):
+    """
+    Perform a crossing switch:
+    1. Swap O and U
+    2. Reverse sign
+    """
+    df_new = df_knot.copy()
+    mask = df_new["index"] == crossing_index
+
+    df_new.loc[mask, "kind"] = df_new.loc[mask, "kind"].map({"O": "U", "U": "O"})
+    df_new.loc[mask, "sign"] *= -1
+
+    return df_new
+
+
+def dataframe_to_gauss_string(df_knot):
+    """
+    Convert DataFrame back to Gauss code string.
+    """
+    df_sorted = df_knot.sort_values("step")
+    tokens = []
+
+    for _, row in df_sorted.iterrows():
+        sign_char = "+" if row["sign"] > 0 else "-"
+        tokens.append("{}{}{}".format(row["kind"], row["index"], sign_char))
+
+    return " ".join(tokens)
+
+
+OUTPUT_FILENAME = "all_versions_strings.csv"
+label_counts = defaultdict(int)
+
+with open(INPUT_FILENAME, "r") as fin, open(OUTPUT_FILENAME, "w", newline="") as fout:
+    writer = csv.writer(fout)
+    writer.writerow(["knot", "label", "version", "switched_crossing", "gauss_string"])
+
+    for line in fin:
+        entry = line.strip()
+
+        if not entry:
+            continue
+        if entry.startswith("----") or entry.startswith("Number of knots"):
+            continue
+
+        parts = entry.split(maxsplit=1)
+        if len(parts) < 2:
+            continue
+
+        label, code = parts
+
+        label_counts[label] += 1
+        knot_name = "{}_{}".format(label, label_counts[label])
+
+        tokens = tokenize_gauss_code(code)
+        df_knot = parse_tokens_to_dataframe(tokens, knot_name, label)
+
+        original_string = dataframe_to_gauss_string(df_knot)
+        writer.writerow([knot_name, label, "orig", "", original_string])
+
+        for crossing_index in sorted(df_knot["index"].unique()):
+            df_variant = switch_crossing(df_knot, crossing_index)
+            variant_string = dataframe_to_gauss_string(df_variant)
+
+            writer.writerow([
+                knot_name,
+                label,
+                "switch_{}".format(crossing_index),
+                crossing_index,
+                variant_string
+            ])
+
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python, caption={Simplification Algorithm Using $R1$ and $R2$ Moves}]
+
+import pandas as pd
+import numpy as np
+from dataclasses import dataclass
+
+
+# ----------------------------
+# Data structure for tokens
+# ----------------------------
+@dataclass(frozen=True)
+class Tok:
+    ou: str      # 'O' or 'U'
+    cid: int     # crossing index
+    sign: str    # '+' or '-'
+
+
+# ----------------------------
+# Parsing utilities
+# ----------------------------
+def parse_gauss_string(s):
+    if pd.isna(s):
+        return []
+    parts = str(s).replace(",", " ").split()
+    return [Tok(p[0], int(p[1:-1]), p[-1]) for p in parts]
+
+
+def toks_to_string(toks):
+    return " ".join("{}{}{}".format(t.ou, t.cid, t.sign) for t in toks)
+
+
+# ----------------------------
+# R1 detection and application
+# ----------------------------
+def find_r1_index(toks):
+    n = len(toks)
+    for i in range(n):
+        a = toks[i]
+        b = toks[(i + 1) % n]
+
+        if a.cid == b.cid and a.sign == b.sign and a.ou != b.ou:
+            return i
+    return None
+
+
+def apply_r1_once(toks, i):
+    j = (i + 1) % len(toks)
+
+    if i < j:
+        return toks[:i] + toks[i + 2:]
+    else:
+        return toks[1:-1]
+
+
+# ----------------------------
+# R2 detection and application
+# ----------------------------
+def find_r2_index(toks):
+    n = len(toks)
+    if n < 4:
+        return None
+
+    for i in range(n):
+        block = [toks[(i + k) % n] for k in range(4)]
+        ids = [t.cid for t in block]
+
+        # Must be pattern a b a b with distinct crossings
+        if ids[0] != ids[2] or ids[1] != ids[3] or ids[0] == ids[1]:
+            continue
+
+        # Overs adjacent AND unders adjacent
+        if not (
+            block[0].ou == block[1].ou and
+            block[2].ou == block[3].ou and
+            block[0].ou != block[2].ou
+        ):
+            continue
+
+        a0, a2 = block[0], block[2]
+        b1, b3 = block[1], block[3]
+
+        # Each crossing must have one O and one U with same sign
+        if a0.ou == a2.ou or b1.ou == b3.ou:
+            continue
+        if a0.sign != a2.sign or b1.sign != b3.sign:
+            continue
+
+        # Crossings must have opposite signs
+        if a0.sign == b1.sign:
+            continue
+
+        return i
+
+    return None
+
+
+def apply_r2_once(toks, i):
+    remove = {(i + k) % len(toks) for k in range(4)}
+    return [t for k, t in enumerate(toks) if k not in remove]
+
+
+# ----------------------------
+# Simplification procedure
+# ----------------------------
+def simplify_r1_r2_steps(toks):
+    r1_steps = []
+    r2_steps = []
+    current = toks
+
+    # Apply R1 moves
+    while True:
+        i = find_r1_index(current)
+        if i is None:
+            break
+        current = apply_r1_once(current, i)
+        r1_steps.append(toks_to_string(current))
+
+    # Apply R2 moves (with interleaved R1)
+    while True:
+        i = find_r2_index(current)
+        if i is None:
+            break
+
+        current = apply_r2_once(current, i)
+        r2_steps.append(toks_to_string(current))
+
+        # After each R2, re-apply R1
+        while True:
+            j = find_r1_index(current)
+            if j is None:
+                break
+            current = apply_r1_once(current, j)
+            r1_steps.append(toks_to_string(current))
+
+    return r1_steps, r2_steps, toks_to_string(current)
+
+
+# ----------------------------
+# Apply to dataset
+# ----------------------------
+df = pd.read_csv(INPUT_FILENAME)
+
+r1_all = []
+r2_all = []
+final_all = []
+
+for s in df["gauss_string"]:
+    toks = parse_gauss_string(s)
+    r1, r2, final = simplify_r1_r2_steps(toks)
+
+    r1_all.append(r1)
+    r2_all.append(r2)
+    final_all.append(final)
+
+
+# ----------------------------
+# Expand steps into columns
+# ----------------------------
+max_r1 = max(len(x) for x in r1_all)
+max_r2 = max(len(x) for x in r2_all)
+
+out = df.copy()
+
+for k in range(max_r1):
+    out["R1_step{}".format(k + 1)] = [
+        x[k] if len(x) > k else np.nan for x in r1_all
+    ]
+
+for k in range(max_r2):
+    out["R2_step{}".format(k + 1)] = [
+        x[k] if len(x) > k else np.nan for x in r2_all
+    ]
+
+out["simplified_final"] = final_all
+
+out.to_csv("knots_with_R1_R2_steps.csv", index=False)
+
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python, caption={Two-Crossing Switch Algorithm for Gauss Codes}]
+
+import csv
+from collections import defaultdict
+from itertools import combinations
+import pandas as pd
+
+
+def tokenize_gauss_code(code):
+    """
+    Convert a compact Gauss code string into a list of tokens.
+
+    Example:
+        'O1-O2-U1-O3+U2-U3+'
+    becomes:
+        ['O1-', 'O2-', 'U1-', 'O3+', 'U2-', 'U3+']
+    """
+    code = code.strip()
+    if not code:
+        return []
+
+    tokens = []
+    current = code[0]
+
+    for char in code[1:]:
+        if char in ("O", "U"):
+            tokens.append(current)
+            current = char
+        else:
+            current += char
+
+    tokens.append(current)
+    return tokens
+
+
+def parse_tokens_to_dataframe(tokens, knot_name, label):
+    """
+    Convert Gauss code tokens into a DataFrame with columns:
+    knot, label, step, kind, index, sign
+    """
+    rows = []
+
+    for step, token in enumerate(tokens):
+        kind = token[0]
+        index = int(token[1:-1])
+        sign_char = token[-1]
+        sign = 1 if sign_char == "+" else -1
+
+        rows.append({
+            "knot": knot_name,
+            "label": label,
+            "step": step,
+            "kind": kind,
+            "index": index,
+            "sign": sign
+        })
+
+    return pd.DataFrame(rows)
+
+
+def switch_crossings(df_knot, crossing_indices):
+    """
+    Perform crossing switches on multiple crossings by:
+    1. Swapping O and U
+    2. Reversing the sign
+    """
+    df_new = df_knot.copy()
+    crossing_set = set(crossing_indices)
+    mask = df_new["index"].isin(crossing_set)
+
+    df_new.loc[mask, "kind"] = df_new.loc[mask, "kind"].map({"O": "U", "U": "O"})
+    df_new.loc[mask, "sign"] *= -1
+
+    return df_new
+
+
+def dataframe_to_gauss_string(df_knot):
+    """
+    Convert DataFrame back to a spaced Gauss code string.
+    """
+    df_sorted = df_knot.sort_values("step")
+    tokens = []
+
+    for _, row in df_sorted.iterrows():
+        sign_char = "+" if row["sign"] > 0 else "-"
+        tokens.append("{}{}{}".format(row["kind"], row["index"], sign_char))
+
+    return " ".join(tokens)
+
+
+OUTPUT_FILENAME = "all_versions_strings_switch2.csv"
+label_counts = defaultdict(int)
+
+with open(INPUT_FILENAME, "r") as fin, open(OUTPUT_FILENAME, "w", newline="") as fout:
+    writer = csv.writer(fout)
+
+    writer.writerow([
+        "knot",
+        "label",
+        "version",
+        "switched_crossing_1",
+        "switched_crossing_2",
+        "gauss_string"
+    ])
+
+    for line in fin:
+        entry = line.strip()
+
+        if not entry:
+            continue
+        if entry.startswith("----") or entry.startswith("Number of knots"):
+            continue
+
+        parts = entry.split(maxsplit=1)
+        if len(parts) < 2:
+            continue
+
+        label, code = parts
+
+        label_counts[label] += 1
+        knot_name = "{}_{}".format(label, label_counts[label])
+
+        tokens = tokenize_gauss_code(code)
+        df_knot = parse_tokens_to_dataframe(tokens, knot_name, label)
+
+        crossing_ids = sorted(df_knot["index"].unique())
+
+        original_string = dataframe_to_gauss_string(df_knot)
+        writer.writerow([knot_name, label, "orig", "", "", original_string])
+
+        for i, j in combinations(crossing_ids, 2):
+            df_variant = switch_crossings(df_knot, (i, j))
+            variant_string = dataframe_to_gauss_string(df_variant)
+
+            writer.writerow([
+                knot_name,
+                label,
+                "switch_{}_{}".format(i, j),
+                i,
+                j,
+                variant_string
+            ])
+
+\end{lstlisting}
+
